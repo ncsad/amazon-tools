@@ -1,818 +1,1 @@
-# -*- coding: utf-8 -*-
-"""
-Amazon 卖家工具箱 - 合并版
-包含：启动器 / 定价计算器 / 定制尺寸加价拆分
-"""
-import math, re, os, json, threading, sys, subprocess, shutil
-import urllib.request
-import numpy as np
-from urllib.parse import quote
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,
-    QLineEdit, QFileDialog, QHBoxLayout, QVBoxLayout, QSizePolicy,
-    QGraphicsDropShadowEffect, QMessageBox, QMenu, QDialog,
-    QTextEdit, QProgressBar
-)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QColor, QCursor
-from openpyxl import load_workbook, Workbook
-from openpyxl.styles import Font as XFont, PatternFill, Alignment, Border, Side
-from scipy.optimize import minimize
-
-# ============================================================
-# 更新配置
-# ============================================================
-GITHUB_USER   = "ncsad"
-GITHUB_REPO   = "amazon-tools"
-LOCAL_VERSION = "1.0.0"
-UPDATE_FILE   = "Amazon工具箱.py"
-
-# ============================================================
-# 共用样式
-# ============================================================
-COMMON_SS = """
-QMainWindow, QWidget#central, QDialog {
-    background: #DCDCDE;
-}
-QFrame#card {
-    background: #FAFAFA;
-    border-radius: 12px;
-    border: 1px solid #C4C4C4;
-}
-QFrame#titlebar {
-    background: #FAFAFA;
-    border-bottom: 1px solid #C8C8C8;
-}
-QLabel { background: transparent; }
-QLabel#title      { font-family:'Segoe UI'; font-size:16px; font-weight:700; color:#111111; }
-QLabel#section    { font-family:'Segoe UI'; font-size:10px; font-weight:700; color:#666666; letter-spacing:1px; }
-QLabel#field_label{ font-family:'Segoe UI'; font-size:12px; font-weight:500; color:#222222; }
-QLabel#result_label{ font-family:'Segoe UI'; font-size:12px; font-weight:500; color:#333333; }
-QLabel#rate_label { font-family:'Segoe UI'; font-size:11px; color:#666666; }
-QLabel#warn_label { font-family:'Segoe UI'; font-size:11px; font-weight:500; color:#B02020; }
-QLabel#ver_label  { font-family:'Segoe UI'; font-size:10px; color:#AAAAAA; }
-QLineEdit {
-    font-family:'Segoe UI'; font-size:13px; font-weight:500; color:#111111;
-    background:#F2F2F2; border:1.5px solid #BBBBBB; border-radius:6px; padding:5px 10px;
-}
-QLineEdit:focus { border:1.5px solid #0067C0; background:white; }
-QPushButton#mode_btn {
-    font-family:'Segoe UI'; font-size:12px; font-weight:500; color:#444444;
-    background:transparent; border:none; border-radius:6px; padding:5px 14px; min-height:30px;
-}
-QPushButton#mode_btn:hover { background:#D8D8D8; }
-QPushButton#mode_btn_active {
-    font-family:'Segoe UI'; font-size:12px; font-weight:700; color:#0055A8;
-    background:#CCE8FF; border:none; border-radius:6px; padding:5px 14px; min-height:30px;
-}
-QProgressBar { background:#DDDDDD; border:none; border-radius:3px; }
-QProgressBar::chunk {
-    background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #0067C0, stop:1 #40A0E0);
-    border-radius:3px;
-}
-"""
-
-# ============================================================
-# 共用工具函数
-# ============================================================
-def get_all_rates():
-    try:
-        req = urllib.request.Request(
-            "https://api.exchangerate-api.com/v4/latest/USD",
-            headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            rates = json.loads(r.read()).get("rates", {})
-            usd = rates.get("CNY", 7.2)
-            gbp = rates.get("GBP", 0.78)
-            return {"USD": usd, "GBP": usd / gbp}
-    except:
-        return {"USD": 7.2, "GBP": 9.0}
-
-def make_shadow(blur=20, dy=2, alpha=18):
-    s = QGraphicsDropShadowEffect()
-    s.setBlurRadius(blur); s.setOffset(0, dy); s.setColor(QColor(0,0,0,alpha))
-    return s
-
-def make_card():
-    f = QFrame(); f.setObjectName("card"); f.setGraphicsEffect(make_shadow())
-    return f
-
-def make_sep():
-    f = QFrame(); f.setFrameShape(QFrame.Shape.HLine)
-    f.setStyleSheet("color:#E0E0E0; background:#E0E0E0; max-height:1px;")
-    return f
-
-def btn_primary(text, height=42):
-    b = QPushButton(text); b.setMinimumHeight(height)
-    b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-    b.setStyleSheet("""
-        QPushButton { font-family:'Segoe UI'; font-size:14px; font-weight:700;
-            color:white; background:#0067C0; border:none; border-radius:8px; padding:10px 24px; }
-        QPushButton:hover   { background:#1478CC; }
-        QPushButton:pressed { background:#005294; }
-        QPushButton:disabled { background:#A0C4E8; color:#E0EEF8; }
-    """)
-    return b
-
-def btn_secondary(text, height=42):
-    b = QPushButton(text); b.setMinimumHeight(height)
-    b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-    b.setStyleSheet("""
-        QPushButton { font-family:'Segoe UI'; font-size:13px; font-weight:500;
-            color:#2A2A2A; background:#E8E8E8; border:1.5px solid #C8C8C8;
-            border-radius:8px; padding:10px 18px; }
-        QPushButton:hover  { background:#DCDCDC; }
-        QPushButton:pressed { background:#CCCCCC; }
-    """)
-    return b
-
-class CopyableEdit(QLineEdit):
-    def __init__(self, color="#1A1A1A", size="13px", weight="600"):
-        super().__init__("—")
-        self.setReadOnly(True)
-        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.customContextMenuRequested.connect(self._menu)
-        self.setStyleSheet(f"QLineEdit {{ font-family:'Segoe UI'; font-size:{size};"
-                           f" font-weight:{weight}; color:{color};"
-                           f" background:transparent; border:none; padding:0px; }}")
-    def _menu(self, pos):
-        m = QMenu(self)
-        m.setStyleSheet("QMenu { background:#2A2A2A; color:white; border:none;"
-                        " border-radius:6px; padding:4px; font-family:'Segoe UI'; font-size:12px; }"
-                        "QMenu::item { padding:6px 20px; border-radius:4px; }"
-                        "QMenu::item:selected { background:#444; }")
-        act = m.addAction("复制"); act.setShortcut("Ctrl+C")
-        if m.exec(self.mapToGlobal(pos)) == act:
-            QApplication.clipboard().setText(self.text())
-
-class FieldRow(QWidget):
-    def __init__(self, label, default="", unit=""):
-        super().__init__(); self.setStyleSheet("background:transparent;")
-        lo = QHBoxLayout(self); lo.setContentsMargins(0,2,0,2); lo.setSpacing(8)
-        lbl = QLabel(label); lbl.setObjectName("field_label")
-        lbl.setFixedWidth(58); lbl.setAlignment(Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter)
-        self.entry = QLineEdit(default); self.entry.setFixedWidth(100)
-        lo.addWidget(lbl); lo.addWidget(self.entry)
-        if unit:
-            u = QLabel(unit); u.setStyleSheet("font-family:'Segoe UI'; font-size:11px; color:#AAAAAA;")
-            lo.addWidget(u)
-        lo.addStretch()
-    def text(self): return self.entry.text()
-    def clear(self, d=""): self.entry.setText(d)
-
-class ResultRow(QWidget):
-    def __init__(self, label, highlight=False):
-        super().__init__(); self.setStyleSheet("background:transparent;")
-        lo = QHBoxLayout(self); lo.setContentsMargins(0,3,0,3); lo.setSpacing(8)
-        lbl = QLabel(label); lbl.setObjectName("result_label")
-        lbl.setFixedWidth(72); lbl.setAlignment(Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter)
-        color = "#0A7A3E" if highlight else "#1A1A1A"
-        size  = "15px"    if highlight else "13px"
-        weight= "700"     if highlight else "600"
-        self.val = CopyableEdit(color=color, size=size, weight=weight)
-        self.val.setFixedWidth(160)
-        lo.addWidget(lbl); lo.addWidget(self.val); lo.addStretch()
-    def set(self, t): self.val.setText(t)
-    def reset(self):  self.val.setText("—")
-
-def mode_buttons(parent_layout, callback):
-    btns = {}
-    for label, val in [("🇺🇸  美国","US"),("🇬🇧  英国","UK")]:
-        b = QPushButton(label); b.setObjectName("mode_btn")
-        b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        b.clicked.connect(lambda _, v=val: callback(v))
-        parent_layout.addWidget(b); btns[val] = b
-    return btns
-
-def refresh_mode_btns(btns, val, app):
-    for v, b in btns.items():
-        b.setObjectName("mode_btn_active" if v==val else "mode_btn")
-        b.setStyle(b.style())
-
-# ============================================================
-# 定价计算器窗口
-# ============================================================
-def calc_vol_weight(l,w,h): return l*w*h/6000
-def calc_billing(a,l,w,h): return max(a, calc_vol_weight(l,w,h))
-
-def check_oversize_us(l,w,h):
-    d=sorted([l,w,h],reverse=True); g=(d[1]+d[2])*2+d[0]; c=d[0]+2*d[1]+2*d[2]
-    if d[0]>273: return 3
-    if g>=330 or d[0]>=243: return 2
-    if d[0]>=121 or d[1]>=76 or c>=266: return 1
-    return 0
-
-def shipping_us(bw,l,w,h,kg):
-    d=sorted([l,w,h],reverse=True); g=(d[1]+d[2])*2+d[0]; c=d[0]+2*d[1]+2*d[2]
-    lv=check_oversize_us(l,w,h)
-    cp=27+bw*100; cs=(80+math.ceil(bw)*30) if bw<=6 else None
-    cl=290 if bw<=10 else 290+math.ceil(bw-10)*27
-    sl=0; wn=[]
-    if kg>68: wn.append("⚠ 实重>68KG 大包拒收")
-    if d[0]>273: sl+=5000; wn.append("⚠ 大包超规+5000元")
-    elif g>=330 or d[0]>=243: sl+=600; wn.append("⚠ 大包超规+600元")
-    elif d[0]>=121 or d[1]>=76 or c>=266: sl+=150; wn.append("⚠ 大包超规+150元")
-    if kg>30: sl+=350; wn.append("⚠ 超重+350元")
-    elif kg>22: sl+=160; wn.append("⚠ 超重+160元")
-    cands=[]
-    if lv==0 and bw<=0.83: cands.append(("小包裹",cp,0,[]))
-    if cs and lv<2:
-        ss=120 if lv==1 else 0; ws=["⚠ 中小件超规+120元"] if lv==1 else []
-        cands.append(("经济中小件",cs+ss,ss,ws))
-    cands.append(("大包经济线",cl+sl,sl,wn))
-    best=min(cands,key=lambda x:x[1])
-    return best[0],best[1],best[1]-best[2],best[2],best[3]
-
-def shipping_uk(bw,l,w,h):
-    base=25+bw*50 if bw<=3 else 57*bw+30
-    d=sorted([l,w,h],reverse=True); g=(d[1]+d[2])*2+d[0]
-    ls=0
-    for t,f in [(180,200),(170,180),(160,150),(150,100),(140,70),(120,32)]:
-        if d[0]>=t: ls=f; break
-    gs=150 if g>=266 else 0; sur=max(ls,gs)
-    return "英国经济线",base+sur,base,sur,[f"⚠ 英国超规+{sur}元"] if sur else []
-
-def calc_price(cost,ship,profit,fx,coeff,zi=10,zs=10):
-    E2=cost+ship; D2=E2/(1-profit); C2=D2/fx/0.7
-    return {"E2":round(E2,2),"sell":round(C2,2),
-            "markup":round(C2*fx/coeff-zi-zs,2),"profit":round(profit*100,2)}
-
-class PricingWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("亚马逊定价计算器")
-        self.setFixedSize(680,540)
-        self.rates={"US":None,"UK":None}; self.mode="US"; self._pinned=False
-        self._build(); self._fetch()
-
-    def _build(self):
-        c=QWidget(); c.setObjectName("central"); self.setCentralWidget(c)
-        root=QVBoxLayout(c); root.setContentsMargins(0,0,0,0); root.setSpacing(0)
-        # titlebar
-        tb=QFrame(); tb.setObjectName("titlebar"); tb.setFixedHeight(56)
-        tbl=QHBoxLayout(tb); tbl.setContentsMargins(20,0,20,0)
-        tbl.addWidget(QLabel("🛒")); tbl.addSpacing(8)
-        t=QLabel("亚马逊定价计算器"); t.setObjectName("title"); tbl.addWidget(t)
-        tbl.addStretch()
-        self.pin_btn=QPushButton("📌 置顶"); self.pin_btn.setObjectName("mode_btn")
-        self.pin_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.pin_btn.clicked.connect(self._pin); tbl.addWidget(self.pin_btn); tbl.addSpacing(8)
-        self.mode_btns=mode_buttons(tbl, self._set_mode)
-        tbl.addSpacing(12)
-        self.rate_lbl=QLabel("获取汇率…"); self.rate_lbl.setObjectName("rate_label"); tbl.addWidget(self.rate_lbl)
-        root.addWidget(tb); root.addWidget(make_sep())
-        # body
-        body=QWidget(); body.setStyleSheet("background:#DCDCDE;")
-        bl=QHBoxLayout(body); bl.setContentsMargins(16,16,16,16); bl.setSpacing(14)
-        # left
-        lc=make_card(); ll=QVBoxLayout(lc); ll.setContentsMargins(20,16,20,16); ll.setSpacing(6)
-        s=QLabel("产品信息"); s.setObjectName("section"); ll.addWidget(s); ll.addSpacing(4)
-        self.flds={"cost":FieldRow("产品成本","","元"),"length":FieldRow("长","","cm"),
-                   "width":FieldRow("宽","","cm"),"height":FieldRow("高","","cm"),
-                   "weight":FieldRow("实重","","kg"),"profit":FieldRow("利润率","50","%")}
-        for f in self.flds.values(): ll.addWidget(f); f.entry.returnPressed.connect(self._calc)
-        ll.addSpacing(8)
-        br=QHBoxLayout(); br.setSpacing(10)
-        cb=btn_primary("计  算"); cb.clicked.connect(self._calc)
-        clb=btn_secondary("清  空"); clb.clicked.connect(self._clear)
-        br.addWidget(cb,3); br.addWidget(clb,1); ll.addLayout(br); ll.addStretch()
-        # right
-        rc=make_card(); rl=QVBoxLayout(rc); rl.setContentsMargins(20,16,20,16); rl.setSpacing(4)
-        s2=QLabel("计算结果"); s2.setObjectName("section"); rl.addWidget(s2); rl.addSpacing(4)
-        ch=QWidget(); ch.setStyleSheet("background:transparent;")
-        chl=QHBoxLayout(ch); chl.setContentsMargins(0,2,0,6); chl.setSpacing(8)
-        chlbl=QLabel("渠道"); chlbl.setObjectName("result_label"); chlbl.setFixedWidth(72)
-        chlbl.setAlignment(Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter)
-        self.ch_val=CopyableEdit(color="#333333",size="12px",weight="500")
-        chl.addWidget(chlbl); chl.addWidget(self.ch_val); chl.addStretch()
-        rl.addWidget(ch); rl.addWidget(make_sep()); rl.addSpacing(4)
-        self.res={"cost_o":ResultRow("产品成本"),"ship_o":ResultRow("头程运费"),
-                  "e2_o":ResultRow("总成本"),"sell_o":ResultRow("售  价",True),
-                  "markup_o":ResultRow("加价(RMB)",True),"profit_o":ResultRow("利润率")}
-        for r in self.res.values(): rl.addWidget(r)
-        rl.addSpacing(8)
-        self.warn=QLabel(""); self.warn.setObjectName("warn_label"); self.warn.setWordWrap(True)
-        rl.addWidget(self.warn); rl.addStretch()
-        bl.addWidget(lc,5); bl.addWidget(rc,5); root.addWidget(body)
-        self._set_mode("US")
-
-    def _pin(self):
-        self._pinned=not self._pinned
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint,self._pinned); self.show()
-        self.pin_btn.setText("📌 置顶 ✓" if self._pinned else "📌 置顶")
-        self.pin_btn.setObjectName("mode_btn_active" if self._pinned else "mode_btn")
-        self.pin_btn.setStyle(self.pin_btn.style())
-
-    def _set_mode(self,val):
-        self.mode=val; refresh_mode_btns(self.mode_btns,val,self)
-        r=self.rates.get(val); sym="USD" if val=="US" else "GBP"
-        self.rate_lbl.setText(f"1 {sym} = ¥{r:.4f}" if r else f"获取 {sym} 汇率…")
-        for v in self.res.values(): v.reset()
-        self.ch_val.setText("—"); self.warn.setText("")
-
-    def _fetch(self):
-        def f():
-            r=get_all_rates(); self.rates["US"]=r["USD"]; self.rates["UK"]=r["GBP"]
-            QTimer.singleShot(0,lambda:self._set_mode(self.mode))
-        threading.Thread(target=f,daemon=True).start()
-
-    def _clear(self):
-        defs={"cost":"","length":"","width":"","height":"","weight":"","profit":"50"}
-        for k,f in self.flds.items(): f.clear(defs[k])
-        for v in self.res.values(): v.reset()
-        self.ch_val.setText("—"); self.warn.setText("")
-
-    def _calc(self):
-        try:
-            cost=float(self.flds["cost"].text()); l=float(self.flds["length"].text())
-            w=float(self.flds["width"].text()); h=float(self.flds["height"].text())
-            wt=float(self.flds["weight"].text()); pr=float(self.flds["profit"].text())
-        except ValueError:
-            QMessageBox.warning(self,"输入错误","请确认所有字段均已填写数字"); return
-        if not (0<pr<100): QMessageBox.warning(self,"输入错误","利润率需在0~100之间"); return
-        pr/=100
-        fx=self.rates.get(self.mode) or (7.2 if self.mode=="US" else 9.0)
-        sym="$" if self.mode=="US" else "£"; coeff=1.38*2 if self.mode=="US" else 1.34*2
-        vw=calc_vol_weight(l,w,h); bw=calc_billing(wt,l,w,h)
-        wtype="体积重" if vw>wt else "实重"
-        if self.mode=="US": ch,total,base,sur,warns=shipping_us(bw,l,w,h,wt)
-        else: ch,total,base,sur,warns=shipping_uk(bw,l,w,h)
-        result=calc_price(cost,total,pr,fx,coeff)
-        extra=""
-        if result["markup"]<0: extra="⚠ 加价为负，已切换智赢5/5重新计算\n"; result=calc_price(cost,total,pr,fx,coeff,5,5)
-        self.ch_val.setText(f"{ch}  ({bw:.2f}kg · {wtype})")
-        self.res["cost_o"].set(f"¥{cost:.2f}"); self.res["ship_o"].set(f"¥{total:.2f}")
-        self.res["e2_o"].set(f"¥{result['E2']:.2f}"); self.res["sell_o"].set(f"{sym}{result['sell']:.2f}")
-        self.res["markup_o"].set(f"¥{result['markup']:.2f}"); self.res["profit_o"].set(f"{result['profit']:.1f}%")
-        self.warn.setText(extra+"\n".join(warns))
-
-# ============================================================
-# 定制尺寸加价拆分窗口
-# ============================================================
-COEFF={"US":1.38*2,"UK":1.34*2}; SYM={"US":"$","UK":"£"}
-
-def calc_sell(mk,fx,mode,zi,zs):
-    return math.ceil((mk+zi+zs)*COEFF[mode]/fx)-0.01
-
-def extract_num(val):
-    if val is None: return None,None,None
-    s=str(val).strip()
-    m=re.match(r'^([^\d]*)(\d+\.?\d*)\s*([a-zA-Z"\'°]*)$',s.replace(' ','').replace(':',''))
-    if m:
-        pre=re.sub(r'[:\s]','',m.group(1)).strip()
-        return float(m.group(2)),m.group(3).upper() or "",pre
-    return None,None,None
-
-def read_data(fp,nd,fx,mode,zi,zs):
-    wb=load_workbook(fp,read_only=True,data_only=True); ws=wb.active
-    rows=list(ws.iter_rows(values_only=True)); wb.close()
-    sc=sr=0; mc=nd
-    for i,row in enumerate(rows):
-        first=next((j for j,v in enumerate(row) if v is not None),None)
-        if first is None: continue
-        sc=first; mc=sc+nd
-        try: float(row[mc]); sr=i; break
-        except: continue
-    is_text=isinstance(rows[sr][sc],str)
-    data=[]; units=[None]*nd; prefixes=[None]*nd
-    for row in rows[sr:]:
-        try:
-            dims=[]
-            for i in range(nd):
-                cell=row[sc+i]
-                if is_text:
-                    n,u,p=extract_num(cell)
-                    if n is None: raise ValueError
-                    if units[i] is None and u: units[i]=u
-                    if prefixes[i] is None and p: prefixes[i]=p
-                    dims.append(n)
-                else: dims.append(float(cell))
-            mk=float(row[mc]); sell=calc_sell(mk,fx,mode,zi,zs)
-            data.append(tuple(dims)+(mk,sell))
-        except: continue
-    if not data: raise ValueError("未读取到有效数据，请检查变量列数配置")
-    dn=[prefixes[i] or chr(65+i) for i in range(nd)]
-    dv=[sorted(set(d[i] for d in data)) for i in range(nd)]
-    return data,dv,units,dn
-
-def do_optimize(data,dv,nd,mr):
-    offs=[1]
-    for d in dv: offs.append(offs[-1]+len(d)-1)
-    nv=offs[-1]; y=np.array([d[-1] for d in data])
-    def p1(x,row):
-        t=x[0]
-        for i in range(nd):
-            j=dv[i].index(row[i])
-            if j>0: t+=x[offs[i]+j-1]
-        return t
-    def pa(x): return np.array([p1(x,r) for r in data])
-    cons=[{'type':'ineq','fun':lambda x,r=row,p=float(pr):p1(x,r)-mr*p} for row,pr in zip(data,y)]
-    x0=np.ones(nv); x0[0]=y.min()*mr
-    res=minimize(lambda x:np.sum((pa(x)-y)**2),x0,method='SLSQP',
-                 bounds=[(0,None)]*nv,constraints=cons,options={'ftol':1e-9,'maxiter':10000})
-    return res.x,pa(res.x),offs,y
-
-def write_xl(path,nd,dv,dn,units,x,offs,data,pred,y,mr,mode):
-    sym=SYM[mode]; wb=Workbook()
-    hf=PatternFill("solid",start_color="2C3E50"); sf=PatternFill("solid",start_color="EBF5FB")
-    gf=PatternFill("solid",start_color="D5F5E3"); yf=PatternFill("solid",start_color="FEF9E7")
-    rf=PatternFill("solid",start_color="FADBD8"); cf=PatternFill("solid",start_color="BDC3C7")
-    bw=XFont(bold=True,color="FFFFFF",name="Arial",size=10); bold=XFont(bold=True,name="Arial",size=10)
-    norm=XFont(name="Arial",size=10); redf=XFont(name="Arial",size=10,color="E74C3C")
-    ctr=Alignment(horizontal="center",vertical="center")
-    thin=Border(left=Side(style="thin"),right=Side(style="thin"),top=Side(style="thin"),bottom=Side(style="thin"))
-    def sc(cell,font=norm,fill=None,border=thin):
-        cell.font=font; cell.alignment=ctr; cell.border=border
-        if fill: cell.fill=fill
-    def fv(v,u): return f"{v}{u or ''}"
-    ws1=wb.active; ws1.title="各维度加价表"; r=1
-    ws1.merge_cells(f"A{r}:C{r}")
-    sc(ws1.cell(r,1,f"Amazon 定制加价拆分  [{mode}站]"),font=XFont(bold=True,size=13,name="Arial",color="FFFFFF"),fill=hf)
-    ws1.row_dimensions[r].height=26; r+=2
-    ws1.merge_cells(f"A{r}:C{r}"); sc(ws1.cell(r,1,"【基础价格】"),font=bold,fill=sf); r+=1
-    for c,h in [(1,"项目"),(2,f"金额({sym})"),(3,"备注")]: sc(ws1.cell(r,c,h),font=bold,fill=cf)
-    r+=1; bp=math.ceil(x[0])-0.01
-    sc(ws1.cell(r,1,"基础价格")); ws1.cell(r,2,bp); ws1.cell(r,2).number_format=f'"{sym}"#,##0.00'
-    sc(ws1.cell(r,2)); sc(ws1.cell(r,3,"所有组合共享，叠加各维度增量")); r+=2
-    for i in range(nd):
-        u=units[i] or ""; ws1.merge_cells(f"A{r}:C{r}")
-        sc(ws1.cell(r,1,f"【{dn[i]} 增量】"),font=bold,fill=sf); r+=1
-        for c,h in [(1,f"值({u})"if u else"值"),(2,f"增量({sym})"),(3,"备注")]: sc(ws1.cell(r,c,h),font=bold,fill=cf)
-        r+=1
-        for j,val in enumerate(dv[i]):
-            inc=0.0 if j==0 else round(x[offs[i]+j-1])
-            sc(ws1.cell(r,1,fv(val,u))); ws1.cell(r,2,inc); ws1.cell(r,2).number_format=f'"{sym}"#,##0.00'
-            sc(ws1.cell(r,2)); sc(ws1.cell(r,3,"基准档"if j==0 else"增量")); r+=1
-        r+=1
-    ws1.merge_cells(f"A{r}:C{r}"); sc(ws1.cell(r,1,f"约束：拆分价≥原价×{int(mr*100)}%"),font=redf)
-    for col,w in [("A",18),("B",14),("C",28)]: ws1.column_dimensions[col].width=w
-    ws2=wb.create_sheet("验证对比表")
-    hdrs=dn+["加价(¥)",f"前台售价({sym})",f"拆分价({sym})","差额","误差%","状态"]
-    for c,h in enumerate(hdrs,1): sc(ws2.cell(1,c,h),font=bw,fill=hf)
-    errs=(pred-y)/y*100; thr=-(1-mr)*100
-    for ri,(rd,p,e) in enumerate(zip(data,pred,errs),2):
-        for c in range(nd): sc(ws2.cell(ri,c+1,fv(rd[c],units[c])))
-        sc(ws2.cell(ri,nd+1,round(rd[nd],2))); ws2.cell(ri,nd+1).number_format='"¥"#,##0.00'
-        sv=rd[nd+1]
-        for col,val,fs in [(nd+2,round(sv,2),f'"{sym}"#,##0.00'),(nd+3,round(p,2),f'"{sym}"#,##0.00'),(nd+4,round(p-sv,2),f'"{sym}"#,##0.00')]:
-            ws2.cell(ri,col,val).number_format=fs; sc(ws2.cell(ri,col))
-        sc(ws2.cell(ri,nd+5,round(e,1)))
-        if e<thr-0.05: st,fi="⚠️触红线",rf
-        elif e<0: st,fi=f"↓低{abs(e):.1f}%",yf
-        else: st,fi=f"↑高{e:.1f}%",gf
-        sc(ws2.cell(ri,nd+6,st),fill=fi)
-    for c in range(1,nd+7): ws2.column_dimensions[ws2.cell(1,c).column_letter].width=14
-    ws3=wb.create_sheet("误差统计")
-    for c,h in enumerate(["统计项","数值"],1): sc(ws3.cell(1,c,h),font=bw,fill=hf)
-    stats=[("总组合数",len(data)),("低于前台售价",int((errs<0).sum())),
-           (f"触碰{int(mr*100)}%红线",int((errs<thr-0.05).sum())),
-           ("高于前台售价",int((errs>0).sum())),("最大低于",f"{errs.min():.1f}%"),
-           ("最大高于",f"{errs.max():.1f}%"),("平均绝对误差",f"{np.abs(errs).mean():.1f}%")]
-    for ri,(k,v) in enumerate(stats,2): sc(ws3.cell(ri,1,k)); sc(ws3.cell(ri,2,v))
-    ws3.column_dimensions["A"].width=24; ws3.column_dimensions["B"].width=16
-    wb.save(path); return errs
-
-class SplitWorker(QThread):
-    done=pyqtSignal(dict); error=pyqtSignal(str)
-    def __init__(self,fp,nd,fx,mode,zi,zs,mr):
-        super().__init__(); self.fp=fp; self.nd=nd; self.fx=fx
-        self.mode=mode; self.zi=zi; self.zs=zs; self.mr=mr
-    def run(self):
-        try:
-            data,dv,units,dn=read_data(self.fp,self.nd,self.fx,self.mode,self.zi,self.zs)
-            x,pred,offs,y=do_optimize(data,dv,self.nd,self.mr)
-            errs=(pred-y)/y*100
-            folder=os.path.join(os.path.dirname(self.fp),"拆分结果"); os.makedirs(folder,exist_ok=True)
-            base=os.path.basename(self.fp).replace(".xlsx","")
-            out=os.path.join(folder,f"{base}_拆分结果_{self.mode}.xlsx")
-            write_xl(out,self.nd,dv,dn,units,x,offs,data,pred,y,self.mr,self.mode)
-            thr=-(1-self.mr)*100
-            self.done.emit({"count":len(data),"avg_err":f"{np.abs(errs).mean():.1f}%",
-                            "max_low":f"{errs.min():.1f}%","max_hi":f"{errs.max():.1f}%",
-                            "outfile":os.path.basename(out),"outfile_path":out,
-                            "red":int((errs<thr-0.05).sum())})
-        except Exception as e: self.error.emit(str(e))
-
-class DropZone(QFrame):
-    def __init__(self,on_file):
-        super().__init__(); self.on_file=on_file; self._fp=""
-        self.setAcceptDrops(True); self.setMinimumHeight(120)
-        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self._ns="QFrame{background:#FAFAFA;border:2px dashed #C8C8C8;border-radius:10px;}"
-        self._hs="QFrame{background:#F0F7FF;border:2px dashed #0067C0;border-radius:10px;}"
-        self.setStyleSheet(self._ns)
-        lo=QVBoxLayout(self); lo.setAlignment(Qt.AlignmentFlag.AlignCenter); lo.setSpacing(6)
-        self.icon=QLabel("📂"); self.icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.icon.setStyleSheet("font-size:26px; border:none; background:transparent;")
-        self.hint=QLabel("拖入 Excel 文件，或点击选择")
-        self.hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.hint.setStyleSheet("font-family:'Segoe UI'; font-size:12px; color:#888; border:none; background:transparent;")
-        self.fname=QLabel(""); self.fname.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.fname.setStyleSheet("font-family:'Segoe UI'; font-size:12px; font-weight:600; color:#0067C0; border:none; background:transparent;")
-        lo.addWidget(self.icon); lo.addWidget(self.hint); lo.addWidget(self.fname)
-    def mousePressEvent(self,e):
-        p,_=QFileDialog.getOpenFileName(self,"选择Excel文件","","Excel文件 (*.xlsx)")
-        if p: self._set(p)
-    def dragEnterEvent(self,e):
-        if e.mimeData().hasUrls(): e.acceptProposedAction(); self.setStyleSheet(self._hs)
-    def dragLeaveEvent(self,e): self.setStyleSheet(self._ns)
-    def dropEvent(self,e):
-        self.setStyleSheet(self._ns)
-        urls=e.mimeData().urls()
-        if urls: self._set(urls[0].toLocalFile())
-    def _set(self,p):
-        if not p.lower().endswith(".xlsx"):
-            QMessageBox.warning(self,"格式错误","请选择 .xlsx 文件"); return
-        self._fp=p; self.icon.setText("✅"); self.hint.setText("已选择："); self.fname.setText(os.path.basename(p)); self.on_file(p)
-    def get_path(self): return self._fp
-    def reset(self):
-        self._fp=""; self.icon.setText("📂"); self.hint.setText("拖入 Excel 文件，或点击选择"); self.fname.setText("")
-
-class SplitterResultRow(QWidget):
-    def __init__(self,label,color="#1A1A1A"):
-        super().__init__(); self.setStyleSheet("background:transparent;")
-        lo=QHBoxLayout(self); lo.setContentsMargins(0,3,0,3); lo.setSpacing(8)
-        lbl=QLabel(label); lbl.setObjectName("result_label"); lbl.setFixedWidth(70)
-        self.val=QLabel("—")
-        self.val.setStyleSheet(f"font-family:'Segoe UI'; font-size:13px; font-weight:600; color:{color};")
-        lo.addWidget(lbl); lo.addWidget(self.val); lo.addStretch()
-    def set(self,t): self.val.setText(t)
-
-class SplitterWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("定制尺寸加价拆分")
-        self.setFixedSize(760,560)
-        self.rates={"US":None,"UK":None}; self.mode="US"; self.worker=None
-        self._build(); self._fetch()
-
-    def _build(self):
-        c=QWidget(); c.setObjectName("central"); self.setCentralWidget(c)
-        root=QVBoxLayout(c); root.setContentsMargins(0,0,0,0); root.setSpacing(0)
-        tb=QFrame(); tb.setObjectName("titlebar"); tb.setFixedHeight(56)
-        tbl=QHBoxLayout(tb); tbl.setContentsMargins(20,0,20,0)
-        tbl.addWidget(QLabel("📦")); tbl.addSpacing(8)
-        t=QLabel("定制尺寸加价拆分"); t.setObjectName("title"); tbl.addWidget(t); tbl.addStretch()
-        self.mode_btns=mode_buttons(tbl,self._set_mode)
-        tbl.addSpacing(12)
-        self.rate_lbl=QLabel("获取汇率…"); self.rate_lbl.setObjectName("rate_label"); tbl.addWidget(self.rate_lbl)
-        root.addWidget(tb); root.addWidget(make_sep())
-        body=QWidget(); body.setStyleSheet("background:#DCDCDE;")
-        bl=QHBoxLayout(body); bl.setContentsMargins(16,16,16,16); bl.setSpacing(14)
-        # left
-        left=QVBoxLayout(); left.setSpacing(12)
-        fc=make_card(); fl=QVBoxLayout(fc); fl.setContentsMargins(16,14,16,14); fl.setSpacing(8)
-        s=QLabel("EXCEL 文件"); s.setObjectName("section"); fl.addWidget(s)
-        self.drop=DropZone(lambda p:None); fl.addWidget(self.drop); left.addWidget(fc)
-        pc=make_card(); pl=QVBoxLayout(pc); pl.setContentsMargins(16,14,16,14); pl.setSpacing(10)
-        s2=QLabel("参数设置"); s2.setObjectName("section"); pl.addWidget(s2)
-        self.inputs={}
-        for row_params in [[("变量列数","n_dims","3","列"),("智赢 zi","zi","10","")],
-                           [("智赢 zs","zs","10",""),("最低比例","min_ratio","85","%")]]:
-            rw=QWidget(); rw.setStyleSheet("background:transparent;")
-            rl=QHBoxLayout(rw); rl.setContentsMargins(0,0,0,0); rl.setSpacing(16)
-            for lbl,key,dflt,unit in row_params:
-                g=QWidget(); g.setStyleSheet("background:transparent;")
-                gl=QHBoxLayout(g); gl.setContentsMargins(0,0,0,0); gl.setSpacing(6)
-                lb=QLabel(lbl); lb.setStyleSheet("font-family:'Segoe UI'; font-size:12px; color:#444;"); lb.setFixedWidth(62)
-                e=QLineEdit(dflt); e.setFixedWidth(64); self.inputs[key]=e
-                gl.addWidget(lb); gl.addWidget(e)
-                if unit:
-                    u=QLabel(unit); u.setStyleSheet("font-family:'Segoe UI'; font-size:11px; color:#AAAAAA;"); gl.addWidget(u)
-                rl.addWidget(g)
-            rl.addStretch(); pl.addWidget(rw)
-        left.addWidget(pc)
-        br=QHBoxLayout(); br.setSpacing(10)
-        self.run_btn=btn_primary("▶   运  行"); self.run_btn.clicked.connect(self._run)
-        clb=btn_secondary("清  空"); clb.clicked.connect(self._clear)
-        br.addWidget(self.run_btn,3); br.addWidget(clb,1); left.addLayout(br); left.addStretch()
-        # right
-        right=QVBoxLayout()
-        rc=make_card(); rc.setMinimumWidth(310)
-        rl2=QVBoxLayout(rc); rl2.setContentsMargins(20,16,20,16); rl2.setSpacing(4)
-        s3=QLabel("运行结果"); s3.setObjectName("section"); rl2.addWidget(s3); rl2.addSpacing(6)
-        self.rows={"status":SplitterResultRow("状 态"),"count":SplitterResultRow("组合数"),
-                   "avg_err":SplitterResultRow("平均误差"),
-                   "max_low":SplitterResultRow("最大低于","#C05A00"),
-                   "max_hi":SplitterResultRow("最大高于","#0F7B0F")}
-        for r in self.rows.values(): rl2.addWidget(r)
-        orow=QWidget(); orow.setStyleSheet("background:transparent;")
-        ol=QHBoxLayout(orow); ol.setContentsMargins(0,2,0,2); ol.setSpacing(8)
-        olbl=QLabel("输出文件"); olbl.setObjectName("result_label"); olbl.setFixedWidth(70)
-        self.olink=QLabel("—")
-        self.olink.setStyleSheet("font-family:'Segoe UI'; font-size:13px; font-weight:600; color:#0067C0; text-decoration:underline;")
-        self.olink.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.olink.mousePressEvent=self._open_out; self._opath=""
-        ol.addWidget(olbl); ol.addWidget(self.olink); ol.addStretch(); rl2.addWidget(orow)
-        rl2.addSpacing(10)
-        self.prog=QProgressBar(); self.prog.setRange(0,0); self.prog.setFixedHeight(5)
-        self.prog.setTextVisible(False); self.prog.setVisible(False); rl2.addWidget(self.prog)
-        self.warn=QLabel(""); self.warn.setStyleSheet("font-family:'Segoe UI'; font-size:11px; color:#C42B1C; background:transparent;")
-        self.warn.setWordWrap(True); rl2.addWidget(self.warn); rl2.addStretch()
-        right.addWidget(rc)
-        bl.addLayout(left,5); bl.addLayout(right,4); root.addWidget(body)
-        self._set_mode("US")
-
-    def _set_mode(self,val):
-        self.mode=val; refresh_mode_btns(self.mode_btns,val,self)
-        r=self.rates.get(val); sym="USD" if val=="US" else "GBP"
-        self.rate_lbl.setText(f"1 {sym} = ¥{r:.4f}" if r else f"获取 {sym} 汇率…")
-
-    def _fetch(self):
-        def f():
-            r=get_all_rates(); self.rates["US"]=r["USD"]; self.rates["UK"]=r["GBP"]
-            QTimer.singleShot(0,lambda:self._set_mode(self.mode))
-        threading.Thread(target=f,daemon=True).start()
-
-    def _clear(self):
-        self.drop.reset()
-        for k,d in [("n_dims","3"),("zi","10"),("zs","10"),("min_ratio","85")]: self.inputs[k].setText(d)
-        for r in self.rows.values(): r.set("—")
-        self.olink.setText("—"); self._opath=""; self.warn.setText(""); self.prog.setVisible(False)
-
-    def _run(self):
-        fp=self.drop.get_path()
-        if not fp: QMessageBox.warning(self,"错误","请先选择或拖入Excel文件"); return
-        try:
-            nd=int(self.inputs["n_dims"].text()); zi=float(self.inputs["zi"].text())
-            zs=float(self.inputs["zs"].text()); mr=float(self.inputs["min_ratio"].text())/100
-        except ValueError: QMessageBox.warning(self,"输入错误","参数请填写数字"); return
-        fx=self.rates.get(self.mode) or (7.2 if self.mode=="US" else 9.0)
-        self.run_btn.setEnabled(False); self.prog.setVisible(True)
-        self.rows["status"].set("⏳ 计算中…"); self.warn.setText("")
-        self.worker=SplitWorker(fp,nd,fx,self.mode,zi,zs,mr)
-        self.worker.done.connect(self._done); self.worker.error.connect(self._err); self.worker.start()
-
-    def _open_out(self,e=None):
-        if self._opath and os.path.exists(self._opath): os.startfile(self._opath)
-
-    def _done(self,res):
-        self.run_btn.setEnabled(True); self.prog.setVisible(False)
-        self.rows["status"].set("✅ 完成"); self.rows["count"].set(f"{res['count']} 个组合")
-        self.rows["avg_err"].set(res["avg_err"]); self.rows["max_low"].set(res["max_low"])
-        self.rows["max_hi"].set(res["max_hi"]); self._opath=res["outfile_path"]; self.olink.setText(res["outfile"])
-        if res["red"]: self.warn.setText(f"⚠  {res['red']} 个组合触碰红线")
-
-    def _err(self,msg):
-        self.run_btn.setEnabled(True); self.prog.setVisible(False)
-        self.rows["status"].set("❌ 出错"); self.warn.setText(f"错误：{msg}")
-
-# ============================================================
-# 更新逻辑
-# ============================================================
-def gh_raw(filename):
-    return f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/main/{quote(filename,safe='')}"
-
-def gh_get(url,timeout=15):
-    req=urllib.request.Request(url,headers={"User-Agent":"AmazonTools/1.0"})
-    with urllib.request.urlopen(req,timeout=timeout) as r: return r.read().decode("utf-8")
-
-class UpdateChecker(QThread):
-    result=pyqtSignal(dict)
-    def run(self):
-        try:
-            remote=json.loads(gh_get(gh_raw("version.json")))
-            self.result.emit({"has_update":remote.get("version","0")!=LOCAL_VERSION,"remote":remote,"error":""})
-        except Exception as e: self.result.emit({"has_update":False,"remote":{},"error":str(e)})
-
-class Downloader(QThread):
-    progress=pyqtSignal(int,str); done=pyqtSignal(bool,str)
-    def __init__(self,files): super().__init__(); self.files=files
-    def run(self):
-        try:
-            for i,fn in enumerate(self.files):
-                self.progress.emit(int(i/len(self.files)*90),f"下载 {fn}…")
-                dest=os.path.join(os.path.dirname(os.path.abspath(__file__)),fn)
-                raw=gh_get(gh_raw(fn),timeout=30)
-                with open(dest+".tmp","w",encoding="utf-8") as f: f.write(raw)
-                shutil.move(dest+".tmp",dest)
-            self.progress.emit(100,"完成"); self.done.emit(True,"更新成功，重启后生效")
-        except Exception as e: self.done.emit(False,str(e))
-
-class UpdateDialog(QDialog):
-    def __init__(self,info,parent=None):
-        super().__init__(parent); self.setWindowTitle("发现新版本"); self.setFixedSize(400,260)
-        self.info=info
-        lo=QVBoxLayout(self); lo.setContentsMargins(24,20,24,20); lo.setSpacing(12)
-        t=QLabel(f"🆕  发现新版本  v{info.get('version','?')}")
-        t.setStyleSheet("font-family:'Segoe UI'; font-size:15px; font-weight:700; color:#111;")
-        lo.addWidget(t)
-        lb=QLabel("更新内容："); lb.setStyleSheet("font-family:'Segoe UI'; font-size:11px; color:#555;"); lo.addWidget(lb)
-        box=QTextEdit(); box.setReadOnly(True); box.setFixedHeight(70); box.setText(info.get("changelog","无说明"))
-        box.setStyleSheet("font-family:'Segoe UI'; font-size:11px; background:#EFEFEF; border:1px solid #CCC; border-radius:6px; padding:6px; color:#333;")
-        lo.addWidget(box)
-        self.pb=QProgressBar(); self.pb.setRange(0,100); self.pb.setTextVisible(False)
-        self.pb.setFixedHeight(5); self.pb.setVisible(False); lo.addWidget(self.pb)
-        self.sl=QLabel(""); self.sl.setStyleSheet("font-family:'Segoe UI'; font-size:11px; color:#0067C0;"); lo.addWidget(self.sl)
-        lo.addStretch()
-        br=QHBoxLayout(); br.setSpacing(10)
-        self.ubtn=btn_primary("立即更新",36); self.ubtn.clicked.connect(self._start)
-        skp=btn_secondary("跳过",36); skp.clicked.connect(self.reject)
-        br.addStretch(); br.addWidget(skp); br.addWidget(self.ubtn); lo.addLayout(br)
-
-    def _start(self):
-        self.ubtn.setEnabled(False); self.pb.setVisible(True)
-        files=[f for f in self.info.get("files",{}).keys() if f.endswith(".py")]
-        self.dl=Downloader(files); self.dl.progress.connect(lambda p,m:(self.pb.setValue(p),self.sl.setText(m)))
-        self.dl.done.connect(self._fin); self.dl.start()
-
-    def _fin(self,ok,msg):
-        if ok:
-            self.sl.setText("✅ "+msg)
-            QTimer.singleShot(1200,lambda:(self.accept(),
-                subprocess.Popen([sys.executable,os.path.abspath(__file__)],
-                                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform=="win32" else 0),
-                QTimer.singleShot(100,QApplication.quit)))
-        else: self.sl.setText("❌ "+msg); self.ubtn.setEnabled(True)
-
-# ============================================================
-# 启动器主窗口
-# ============================================================
-class AppCard(QFrame):
-    def __init__(self,icon,name,desc,on_click):
-        super().__init__(); self.setFixedSize(260,210)
-        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.setGraphicsEffect(make_shadow())
-        self._ns="QFrame{background:#FAFAFA;border-radius:14px;border:1px solid #D0D0D0;}"
-        self._hs="QFrame{background:#FFFFFF;border-radius:14px;border:1.5px solid #0067C0;}"
-        self._ps="QFrame{background:#F0F0F0;border-radius:14px;border:1.5px solid #005294;}"
-        self.setStyleSheet(self._ns)
-        lo=QVBoxLayout(self); lo.setContentsMargins(24,22,24,18); lo.setSpacing(8)
-        il=QLabel(icon); il.setStyleSheet("font-size:34px; background:transparent; border:none;")
-        nl=QLabel(name); nl.setStyleSheet("font-family:'Segoe UI'; font-size:14px; font-weight:700; color:#111; background:transparent; border:none;")
-        dl=QLabel(desc); dl.setWordWrap(True); dl.setStyleSheet("font-family:'Segoe UI'; font-size:11px; color:#666; background:transparent; border:none;")
-        lo.addWidget(il); lo.addWidget(nl); lo.addWidget(dl); lo.addStretch()
-        lb=btn_primary("启  动",34); lb.clicked.connect(on_click); lo.addWidget(lb)
-        self.sl=QLabel(""); self.sl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.sl.setStyleSheet("font-family:'Segoe UI'; font-size:10px; color:#0067C0; background:transparent; border:none;")
-        lo.addWidget(self.sl)
-    def flash(self,msg): self.sl.setText(msg); QTimer.singleShot(3000,lambda:self.sl.setText(""))
-    def enterEvent(self,e): self.setStyleSheet(self._hs); self.setGraphicsEffect(make_shadow(32,6,30))
-    def leaveEvent(self,e): self.setStyleSheet(self._ns); self.setGraphicsEffect(make_shadow())
-    def mousePressEvent(self,e): self.setStyleSheet(self._ps)
-    def mouseReleaseEvent(self,e): self.setStyleSheet(self._hs)
-
-class LauncherWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Amazon 工具箱")
-        self.setFixedSize(660,380)
-        self._wins={}
-        self._build()
-        QTimer.singleShot(2000,self._check_update)
-
-    def _build(self):
-        c=QWidget(); c.setObjectName("central"); self.setCentralWidget(c)
-        root=QVBoxLayout(c); root.setContentsMargins(0,0,0,0); root.setSpacing(0)
-        tb=QFrame(); tb.setObjectName("titlebar"); tb.setFixedHeight(56)
-        tbl=QHBoxLayout(tb); tbl.setContentsMargins(22,0,22,0)
-        tbl.addWidget(QLabel("🛍️")); tbl.addSpacing(8)
-        t=QLabel("Amazon 卖家工具箱"); t.setObjectName("title"); tbl.addWidget(t); tbl.addStretch()
-        self.upd_lbl=QLabel("检查更新中…"); self.upd_lbl.setObjectName("ver_label"); tbl.addWidget(self.upd_lbl)
-        tbl.addSpacing(10)
-        ub=QPushButton("🔄 检查更新"); ub.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        ub.setStyleSheet("QPushButton{font-family:'Segoe UI';font-size:11px;font-weight:600;color:#0067C0;background:#DCF0FF;border:none;border-radius:6px;padding:5px 12px;} QPushButton:hover{background:#CCE8FF;}")
-        ub.clicked.connect(lambda:(self.upd_lbl.setText("检查中…"),self._check_update()))
-        tbl.addWidget(ub); tbl.addSpacing(10)
-        vl=QLabel(f"v{LOCAL_VERSION}"); vl.setObjectName("ver_label"); tbl.addWidget(vl)
-        root.addWidget(tb); root.addWidget(make_sep())
-        body=QWidget(); body.setStyleSheet("background:#DCDCDE;")
-        bl=QHBoxLayout(body); bl.setContentsMargins(50,35,50,35); bl.setSpacing(30)
-        bl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.card_p=AppCard("🛒","定价计算器","输入产品成本、尺寸、重量，\n自动计算运费与前台售价。",self._open_pricing)
-        self.card_s=AppCard("📦","定制尺寸加价拆分","批量读取加价表，拆分各维度\n增量，输出定制选项价格。",self._open_splitter)
-        bl.addWidget(self.card_p); bl.addWidget(self.card_s); root.addWidget(body)
-
-    def _open_pricing(self):
-        if "pricing" not in self._wins or not self._wins["pricing"].isVisible():
-            w=PricingWindow(); w.setStyleSheet(COMMON_SS); self._wins["pricing"]=w
-        self._wins["pricing"].show(); self._wins["pricing"].raise_()
-        self.card_p.flash("✅ 已打开")
-
-    def _open_splitter(self):
-        if "splitter" not in self._wins or not self._wins["splitter"].isVisible():
-            w=SplitterWindow(); w.setStyleSheet(COMMON_SS); self._wins["splitter"]=w
-        self._wins["splitter"].show(); self._wins["splitter"].raise_()
-        self.card_s.flash("✅ 已打开")
-
-    def _check_update(self):
-        self.checker=UpdateChecker(); self.checker.result.connect(self._on_check); self.checker.start()
-
-    def _on_check(self,res):
-        if res["error"]: self.upd_lbl.setText("⚠ 网络不可用"); return
-        if res["has_update"]:
-            v=res["remote"].get("version","?"); self.upd_lbl.setText(f"🆕 有新版本 v{v}")
-            UpdateDialog(res["remote"],self).exec()
-        else:
-            self.upd_lbl.setText("✅ 已是最新版")
-            QTimer.singleShot(4000,lambda:self.upd_lbl.setText(f"v{LOCAL_VERSION}"))
-
-# ============================================================
-# 入口
-# ============================================================
-if __name__ == "__main__":
-    app=QApplication(sys.argv)
-    app.setStyleSheet(COMMON_SS)
-    app.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
-    w=LauncherWindow(); w.show()
-    sys.exit(app.exec())
+# -*- coding: utf-8 -*-"""Amazon 卖家工具箱 - 合并版包含：启动器 / 定价计算器 / 定制尺寸加价拆分"""import math, re, os, json, threading, sys, subprocess, shutil, sslimport urllib.requestimport numpy as npfrom urllib.parse import quotefrom PyQt6.QtWidgets import (    QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,    QLineEdit, QFileDialog, QHBoxLayout, QVBoxLayout, QSizePolicy,    QGraphicsDropShadowEffect, QMessageBox, QMenu, QDialog,    QTextEdit, QProgressBar)from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimerfrom PyQt6.QtGui import QColor, QCursorfrom openpyxl import load_workbook, Workbookfrom openpyxl.styles import Font as XFont, PatternFill, Alignment, Border, Sidefrom scipy.optimize import minimize# ============================================================# 更新配置# ============================================================GITHUB_USER   = "ncsad"GITHUB_REPO   = "amazon-tools"UPDATE_FILE   = "Amazon工具箱.py"def _get_local_version():    """从本地版本文件读取，没有则用默认值"""    try:        vf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local_version.json")        with open(vf, "r", encoding="utf-8") as f:            return json.load(f).get("version", "1.0.0")    except:        return "1.0.0"LOCAL_VERSION = _get_local_version()# ============================================================# 共用样式# ============================================================COMMON_SS = """QMainWindow, QWidget#central, QDialog {    background: #DCDCDE;}QFrame#card {    background: #FAFAFA;    border-radius: 12px;    border: 1px solid #C4C4C4;}QFrame#titlebar {    background: #FAFAFA;    border-bottom: 1px solid #C8C8C8;}QLabel { background: transparent; }QLabel#title      { font-family:'Segoe UI'; font-size:16px; font-weight:700; color:#111111; }QLabel#section    { font-family:'Segoe UI'; font-size:10px; font-weight:700; color:#666666; letter-spacing:1px; }QLabel#field_label{ font-family:'Segoe UI'; font-size:12px; font-weight:500; color:#222222; }QLabel#result_label{ font-family:'Segoe UI'; font-size:12px; font-weight:500; color:#333333; }QLabel#rate_label { font-family:'Segoe UI'; font-size:11px; color:#666666; }QLabel#warn_label { font-family:'Segoe UI'; font-size:11px; font-weight:500; color:#B02020; }QLabel#ver_label  { font-family:'Segoe UI'; font-size:10px; color:#AAAAAA; }QLineEdit {    font-family:'Segoe UI'; font-size:13px; font-weight:500; color:#111111;    background:#F2F2F2; border:1.5px solid #BBBBBB; border-radius:6px; padding:5px 10px;}QLineEdit:focus { border:1.5px solid #0067C0; background:white; }QPushButton#mode_btn {    font-family:'Segoe UI'; font-size:12px; font-weight:500; color:#444444;    background:transparent; border:none; border-radius:6px; padding:5px 14px; min-height:30px;}QPushButton#mode_btn:hover { background:#D8D8D8; }QPushButton#mode_btn_active {    font-family:'Segoe UI'; font-size:12px; font-weight:700; color:#0055A8;    background:#CCE8FF; border:none; border-radius:6px; padding:5px 14px; min-height:30px;}QProgressBar { background:#DDDDDD; border:none; border-radius:3px; }QProgressBar::chunk {    background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #0067C0, stop:1 #40A0E0);    border-radius:3px;}"""# ============================================================# 共用工具函数# ============================================================def _ssl_ctx():    ctx = ssl.create_default_context()    ctx.check_hostname = False    ctx.verify_mode = ssl.CERT_NONE    return ctxdef get_all_rates():    try:        req = urllib.request.Request(            "https://api.exchangerate-api.com/v4/latest/USD",            headers={"User-Agent": "Mozilla/5.0"})        with urllib.request.urlopen(req, timeout=8, context=_ssl_ctx()) as r:            rates = json.loads(r.read()).get("rates", {})            usd = rates.get("CNY", 7.2)            gbp = rates.get("GBP", 0.78)            return {"USD": usd, "GBP": usd / gbp}    except:        return {"USD": 7.2, "GBP": 9.0}def make_shadow(blur=20, dy=2, alpha=18):    s = QGraphicsDropShadowEffect()    s.setBlurRadius(blur); s.setOffset(0, dy); s.setColor(QColor(0,0,0,alpha))    return sdef make_card():    f = QFrame(); f.setObjectName("card"); f.setGraphicsEffect(make_shadow())    return fdef make_sep():    f = QFrame(); f.setFrameShape(QFrame.Shape.HLine)    f.setStyleSheet("color:#E0E0E0; background:#E0E0E0; max-height:1px;")    return fdef btn_primary(text, height=42):    b = QPushButton(text); b.setMinimumHeight(height)    b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))    b.setStyleSheet("""        QPushButton { font-family:'Segoe UI'; font-size:14px; font-weight:700;            color:white; background:#0067C0; border:none; border-radius:8px; padding:10px 24px; }        QPushButton:hover   { background:#1478CC; }        QPushButton:pressed { background:#005294; }        QPushButton:disabled { background:#A0C4E8; color:#E0EEF8; }    """)    return bdef btn_secondary(text, height=42):    b = QPushButton(text); b.setMinimumHeight(height)    b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))    b.setStyleSheet("""        QPushButton { font-family:'Segoe UI'; font-size:13px; font-weight:500;            color:#2A2A2A; background:#E8E8E8; border:1.5px solid #C8C8C8;            border-radius:8px; padding:10px 18px; }        QPushButton:hover  { background:#DCDCDC; }        QPushButton:pressed { background:#CCCCCC; }    """)    return bclass CopyableEdit(QLineEdit):    def __init__(self, color="#1A1A1A", size="13px", weight="600"):        super().__init__("—")        self.setReadOnly(True)        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)        self.customContextMenuRequested.connect(self._menu)        self.setStyleSheet(f"QLineEdit {{ font-family:'Segoe UI'; font-size:{size};"                           f" font-weight:{weight}; color:{color};"                           f" background:transparent; border:none; padding:0px; }}")    def _menu(self, pos):        m = QMenu(self)        m.setStyleSheet("QMenu { background:#2A2A2A; color:white; border:none;"                        " border-radius:6px; padding:4px; font-family:'Segoe UI'; font-size:12px; }"                        "QMenu::item { padding:6px 20px; border-radius:4px; }"                        "QMenu::item:selected { background:#444; }")        act = m.addAction("复制"); act.setShortcut("Ctrl+C")        if m.exec(self.mapToGlobal(pos)) == act:            QApplication.clipboard().setText(self.text())class FieldRow(QWidget):    def __init__(self, label, default="", unit=""):        super().__init__(); self.setStyleSheet("background:transparent;")        lo = QHBoxLayout(self); lo.setContentsMargins(0,2,0,2); lo.setSpacing(8)        lbl = QLabel(label); lbl.setObjectName("field_label")        lbl.setFixedWidth(58); lbl.setAlignment(Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter)        self.entry = QLineEdit(default); self.entry.setFixedWidth(100)        lo.addWidget(lbl); lo.addWidget(self.entry)        if unit:            u = QLabel(unit); u.setStyleSheet("font-family:'Segoe UI'; font-size:11px; color:#AAAAAA;")            lo.addWidget(u)        lo.addStretch()    def text(self): return self.entry.text()    def clear(self, d=""): self.entry.setText(d)class ResultRow(QWidget):    def __init__(self, label, highlight=False):        super().__init__(); self.setStyleSheet("background:transparent;")        lo = QHBoxLayout(self); lo.setContentsMargins(0,3,0,3); lo.setSpacing(8)        lbl = QLabel(label); lbl.setObjectName("result_label")        lbl.setFixedWidth(72); lbl.setAlignment(Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter)        color = "#0A7A3E" if highlight else "#1A1A1A"        size  = "15px"    if highlight else "13px"        weight= "700"     if highlight else "600"        self.val = CopyableEdit(color=color, size=size, weight=weight)        self.val.setFixedWidth(160)        lo.addWidget(lbl); lo.addWidget(self.val); lo.addStretch()    def set(self, t): self.val.setText(t)    def reset(self):  self.val.setText("—")def mode_buttons(parent_layout, callback):    btns = {}    for label, val in [("🇺🇸  美国","US"),("🇬🇧  英国","UK")]:        b = QPushButton(label); b.setObjectName("mode_btn")        b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))        b.clicked.connect(lambda _, v=val: callback(v))        parent_layout.addWidget(b); btns[val] = b    return btnsdef refresh_mode_btns(btns, val, app):    for v, b in btns.items():        b.setObjectName("mode_btn_active" if v==val else "mode_btn")        b.setStyle(b.style())# ============================================================# 定价计算器窗口# ============================================================def calc_vol_weight(l,w,h): return l*w*h/6000def calc_billing(a,l,w,h): return max(a, calc_vol_weight(l,w,h))def check_oversize_us(l,w,h):    d=sorted([l,w,h],reverse=True); g=(d[1]+d[2])*2+d[0]; c=d[0]+2*d[1]+2*d[2]    if d[0]>273: return 3    if g>=330 or d[0]>=243: return 2    if d[0]>=121 or d[1]>=76 or c>=266: return 1    return 0def shipping_us(bw,l,w,h,kg):    d=sorted([l,w,h],reverse=True); g=(d[1]+d[2])*2+d[0]; c=d[0]+2*d[1]+2*d[2]    lv=check_oversize_us(l,w,h)    cp=27+bw*100; cs=(80+math.ceil(bw)*30) if bw<=6 else None    cl=290 if bw<=10 else 290+math.ceil(bw-10)*27    sl=0; wn=[]    if kg>68: wn.append("⚠ 实重>68KG 大包拒收")    if d[0]>273: sl+=5000; wn.append("⚠ 大包超规+5000元")    elif g>=330 or d[0]>=243: sl+=600; wn.append("⚠ 大包超规+600元")    elif d[0]>=121 or d[1]>=76 or c>=266: sl+=150; wn.append("⚠ 大包超规+150元")    if kg>30: sl+=350; wn.append("⚠ 超重+350元")    elif kg>22: sl+=160; wn.append("⚠ 超重+160元")    cands=[]    if lv==0 and bw<=0.83: cands.append(("小包裹",cp,0,[]))    if cs and lv<2:        ss=120 if lv==1 else 0; ws=["⚠ 中小件超规+120元"] if lv==1 else []        cands.append(("经济中小件",cs+ss,ss,ws))    cands.append(("大包经济线",cl+sl,sl,wn))    best=min(cands,key=lambda x:x[1])    return best[0],best[1],best[1]-best[2],best[2],best[3]def shipping_uk(bw,l,w,h):    base=25+bw*50 if bw<=3 else 57*bw+30    d=sorted([l,w,h],reverse=True); g=(d[1]+d[2])*2+d[0]    ls=0    for t,f in [(180,200),(170,180),(160,150),(150,100),(140,70),(120,32)]:        if d[0]>=t: ls=f; break    gs=150 if g>=266 else 0; sur=max(ls,gs)    return "英国经济线",base+sur,base,sur,[f"⚠ 英国超规+{sur}元"] if sur else []def calc_price(cost,ship,profit,fx,coeff,zi=10,zs=10):    E2=cost+ship; D2=E2/(1-profit); C2=D2/fx/0.7    return {"E2":round(E2,2),"sell":round(C2,2),            "markup":round(C2*fx/coeff-zi-zs,2),"profit":round(profit*100,2)}class PricingWindow(QMainWindow):    def __init__(self):        super().__init__()        self.setWindowTitle("亚马逊定价计算器")        self.setFixedSize(680,540)        self.rates={"US":None,"UK":None}; self.mode="US"; self._pinned=False        self._build(); self._fetch()    def _build(self):        c=QWidget(); c.setObjectName("central"); self.setCentralWidget(c)        root=QVBoxLayout(c); root.setContentsMargins(0,0,0,0); root.setSpacing(0)        # titlebar        tb=QFrame(); tb.setObjectName("titlebar"); tb.setFixedHeight(56)        tbl=QHBoxLayout(tb); tbl.setContentsMargins(20,0,20,0)        tbl.addWidget(QLabel("🛒")); tbl.addSpacing(8)        t=QLabel("亚马逊定价计算器"); t.setObjectName("title"); tbl.addWidget(t)        tbl.addStretch()        self.pin_btn=QPushButton("📌 置顶"); self.pin_btn.setObjectName("mode_btn")        self.pin_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))        self.pin_btn.clicked.connect(self._pin); tbl.addWidget(self.pin_btn); tbl.addSpacing(8)        self.mode_btns=mode_buttons(tbl, self._set_mode)        tbl.addSpacing(12)        self.rate_lbl=QLabel("获取汇率…"); self.rate_lbl.setObjectName("rate_label"); tbl.addWidget(self.rate_lbl)        root.addWidget(tb); root.addWidget(make_sep())        # body        body=QWidget(); body.setStyleSheet("background:#DCDCDE;")        bl=QHBoxLayout(body); bl.setContentsMargins(16,16,16,16); bl.setSpacing(14)        # left        lc=make_card(); ll=QVBoxLayout(lc); ll.setContentsMargins(20,16,20,16); ll.setSpacing(6)        s=QLabel("产品信息"); s.setObjectName("section"); ll.addWidget(s); ll.addSpacing(4)        self.flds={"cost":FieldRow("产品成本","","元"),"length":FieldRow("长","","cm"),                   "width":FieldRow("宽","","cm"),"height":FieldRow("高","","cm"),                   "weight":FieldRow("实重","","kg"),"profit":FieldRow("利润率","50","%")}        for f in self.flds.values(): ll.addWidget(f); f.entry.returnPressed.connect(self._calc)        ll.addSpacing(8)        br=QHBoxLayout(); br.setSpacing(10)        cb=btn_primary("计  算"); cb.clicked.connect(self._calc)        clb=btn_secondary("清  空"); clb.clicked.connect(self._clear)        br.addWidget(cb,3); br.addWidget(clb,1); ll.addLayout(br); ll.addStretch()        # right        rc=make_card(); rl=QVBoxLayout(rc); rl.setContentsMargins(20,16,20,16); rl.setSpacing(4)        s2=QLabel("计算结果"); s2.setObjectName("section"); rl.addWidget(s2); rl.addSpacing(4)        ch=QWidget(); ch.setStyleSheet("background:transparent;")        chl=QHBoxLayout(ch); chl.setContentsMargins(0,2,0,6); chl.setSpacing(8)        chlbl=QLabel("渠道"); chlbl.setObjectName("result_label"); chlbl.setFixedWidth(72)        chlbl.setAlignment(Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter)        self.ch_val=CopyableEdit(color="#333333",size="12px",weight="500")        chl.addWidget(chlbl); chl.addWidget(self.ch_val); chl.addStretch()        rl.addWidget(ch); rl.addWidget(make_sep()); rl.addSpacing(4)        self.res={"cost_o":ResultRow("产品成本"),"ship_o":ResultRow("头程运费"),                  "e2_o":ResultRow("总成本"),"sell_o":ResultRow("售  价",True),                  "markup_o":ResultRow("加价(RMB)",True),"profit_o":ResultRow("利润率")}        for r in self.res.values(): rl.addWidget(r)        rl.addSpacing(8)        self.warn=QLabel(""); self.warn.setObjectName("warn_label"); self.warn.setWordWrap(True)        rl.addWidget(self.warn); rl.addStretch()        bl.addWidget(lc,5); bl.addWidget(rc,5); root.addWidget(body)        self._set_mode("US")    def _pin(self):        self._pinned=not self._pinned        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint,self._pinned); self.show()        self.pin_btn.setText("📌 置顶 ✓" if self._pinned else "📌 置顶")        self.pin_btn.setObjectName("mode_btn_active" if self._pinned else "mode_btn")        self.pin_btn.setStyle(self.pin_btn.style())    def _set_mode(self,val):        self.mode=val; refresh_mode_btns(self.mode_btns,val,self)        r=self.rates.get(val); sym="USD" if val=="US" else "GBP"        self.rate_lbl.setText(f"1 {sym} = ¥{r:.4f}" if r else f"获取 {sym} 汇率…")        for v in self.res.values(): v.reset()        self.ch_val.setText("—"); self.warn.setText("")    def _fetch(self):        def f():            r=get_all_rates(); self.rates["US"]=r["USD"]; self.rates["UK"]=r["GBP"]            QTimer.singleShot(0,lambda:self._set_mode(self.mode))        threading.Thread(target=f,daemon=True).start()    def _clear(self):        defs={"cost":"","length":"","width":"","height":"","weight":"","profit":"50"}        for k,f in self.flds.items(): f.clear(defs[k])        for v in self.res.values(): v.reset()        self.ch_val.setText("—"); self.warn.setText("")    def _calc(self):        try:            cost=float(self.flds["cost"].text()); l=float(self.flds["length"].text())            w=float(self.flds["width"].text()); h=float(self.flds["height"].text())            wt=float(self.flds["weight"].text()); pr=float(self.flds["profit"].text())        except ValueError:            QMessageBox.warning(self,"输入错误","请确认所有字段均已填写数字"); return        if not (0<pr<100): QMessageBox.warning(self,"输入错误","利润率需在0~100之间"); return        pr/=100        fx=self.rates.get(self.mode) or (7.2 if self.mode=="US" else 9.0)        sym="$" if self.mode=="US" else "£"; coeff=1.38*2 if self.mode=="US" else 1.34*2        vw=calc_vol_weight(l,w,h); bw=calc_billing(wt,l,w,h)        wtype="体积重" if vw>wt else "实重"        if self.mode=="US": ch,total,base,sur,warns=shipping_us(bw,l,w,h,wt)        else: ch,total,base,sur,warns=shipping_uk(bw,l,w,h)        result=calc_price(cost,total,pr,fx,coeff)        extra=""        if result["markup"]<0: extra="⚠ 加价为负，已切换智赢5/5重新计算\n"; result=calc_price(cost,total,pr,fx,coeff,5,5)        self.ch_val.setText(f"{ch}  ({bw:.2f}kg · {wtype})")        self.res["cost_o"].set(f"¥{cost:.2f}"); self.res["ship_o"].set(f"¥{total:.2f}")        self.res["e2_o"].set(f"¥{result['E2']:.2f}"); self.res["sell_o"].set(f"{sym}{result['sell']:.2f}")        self.res["markup_o"].set(f"¥{result['markup']:.2f}"); self.res["profit_o"].set(f"{result['profit']:.1f}%")        self.warn.setText(extra+"\n".join(warns))# ============================================================# 定制尺寸加价拆分窗口# ============================================================COEFF={"US":1.38*2,"UK":1.34*2}; SYM={"US":"$","UK":"£"}def calc_sell(mk,fx,mode,zi,zs):    return math.ceil((mk+zi+zs)*COEFF[mode]/fx)-0.01def extract_num(val):    if val is None: return None,None,None    s=str(val).strip()    m=re.match(r'^([^\d]*)(\d+\.?\d*)\s*([a-zA-Z"\'°]*)$',s.replace(' ','').replace(':',''))    if m:        pre=re.sub(r'[:\s]','',m.group(1)).strip()        return float(m.group(2)),m.group(3).upper() or "",pre    return None,None,Nonedef read_data(fp,nd,fx,mode,zi,zs):    wb=load_workbook(fp,read_only=True,data_only=True); ws=wb.active    rows=list(ws.iter_rows(values_only=True)); wb.close()    sc=sr=0; mc=nd    for i,row in enumerate(rows):        first=next((j for j,v in enumerate(row) if v is not None),None)        if first is None: continue        sc=first; mc=sc+nd        try: float(row[mc]); sr=i; break        except: continue    is_text=isinstance(rows[sr][sc],str)    data=[]; units=[None]*nd; prefixes=[None]*nd    for row in rows[sr:]:        try:            dims=[]            for i in range(nd):                cell=row[sc+i]                if is_text:                    n,u,p=extract_num(cell)                    if n is None: raise ValueError                    if units[i] is None and u: units[i]=u                    if prefixes[i] is None and p: prefixes[i]=p                    dims.append(n)                else: dims.append(float(cell))            mk=float(row[mc]); sell=calc_sell(mk,fx,mode,zi,zs)            data.append(tuple(dims)+(mk,sell))        except: continue    if not data: raise ValueError("未读取到有效数据，请检查变量列数配置")    dn=[prefixes[i] or chr(65+i) for i in range(nd)]    dv=[sorted(set(d[i] for d in data)) for i in range(nd)]    return data,dv,units,dndef do_optimize(data,dv,nd,mr):    offs=[1]    for d in dv: offs.append(offs[-1]+len(d)-1)    nv=offs[-1]; y=np.array([d[-1] for d in data])    def p1(x,row):        t=x[0]        for i in range(nd):            j=dv[i].index(row[i])            if j>0: t+=x[offs[i]+j-1]        return t    def pa(x): return np.array([p1(x,r) for r in data])    cons=[{'type':'ineq','fun':lambda x,r=row,p=float(pr):p1(x,r)-mr*p} for row,pr in zip(data,y)]    x0=np.ones(nv); x0[0]=y.min()*mr    res=minimize(lambda x:np.sum((pa(x)-y)**2),x0,method='SLSQP',                 bounds=[(0,None)]*nv,constraints=cons,options={'ftol':1e-9,'maxiter':10000})    return res.x,pa(res.x),offs,ydef write_xl(path,nd,dv,dn,units,x,offs,data,pred,y,mr,mode):    sym=SYM[mode]; wb=Workbook()    hf=PatternFill("solid",start_color="2C3E50"); sf=PatternFill("solid",start_color="EBF5FB")    gf=PatternFill("solid",start_color="D5F5E3"); yf=PatternFill("solid",start_color="FEF9E7")    rf=PatternFill("solid",start_color="FADBD8"); cf=PatternFill("solid",start_color="BDC3C7")    bw=XFont(bold=True,color="FFFFFF",name="Arial",size=10); bold=XFont(bold=True,name="Arial",size=10)    norm=XFont(name="Arial",size=10); redf=XFont(name="Arial",size=10,color="E74C3C")    ctr=Alignment(horizontal="center",vertical="center")    thin=Border(left=Side(style="thin"),right=Side(style="thin"),top=Side(style="thin"),bottom=Side(style="thin"))    def sc(cell,font=norm,fill=None,border=thin):        cell.font=font; cell.alignment=ctr; cell.border=border        if fill: cell.fill=fill    def fv(v,u): return f"{v}{u or ''}"    ws1=wb.active; ws1.title="各维度加价表"; r=1    ws1.merge_cells(f"A{r}:C{r}")    sc(ws1.cell(r,1,f"Amazon 定制加价拆分  [{mode}站]"),font=XFont(bold=True,size=13,name="Arial",color="FFFFFF"),fill=hf)    ws1.row_dimensions[r].height=26; r+=2    ws1.merge_cells(f"A{r}:C{r}"); sc(ws1.cell(r,1,"【基础价格】"),font=bold,fill=sf); r+=1    for c,h in [(1,"项目"),(2,f"金额({sym})"),(3,"备注")]: sc(ws1.cell(r,c,h),font=bold,fill=cf)    r+=1; bp=math.ceil(x[0])-0.01    sc(ws1.cell(r,1,"基础价格")); ws1.cell(r,2,bp); ws1.cell(r,2).number_format=f'"{sym}"#,##0.00'    sc(ws1.cell(r,2)); sc(ws1.cell(r,3,"所有组合共享，叠加各维度增量")); r+=2    for i in range(nd):        u=units[i] or ""; ws1.merge_cells(f"A{r}:C{r}")        sc(ws1.cell(r,1,f"【{dn[i]} 增量】"),font=bold,fill=sf); r+=1        for c,h in [(1,f"值({u})"if u else"值"),(2,f"增量({sym})"),(3,"备注")]: sc(ws1.cell(r,c,h),font=bold,fill=cf)        r+=1        for j,val in enumerate(dv[i]):            inc=0.0 if j==0 else round(x[offs[i]+j-1])            sc(ws1.cell(r,1,fv(val,u))); ws1.cell(r,2,inc); ws1.cell(r,2).number_format=f'"{sym}"#,##0.00'            sc(ws1.cell(r,2)); sc(ws1.cell(r,3,"基准档"if j==0 else"增量")); r+=1        r+=1    ws1.merge_cells(f"A{r}:C{r}"); sc(ws1.cell(r,1,f"约束：拆分价≥原价×{int(mr*100)}%"),font=redf)    for col,w in [("A",18),("B",14),("C",28)]: ws1.column_dimensions[col].width=w    ws2=wb.create_sheet("验证对比表")    hdrs=dn+["加价(¥)",f"前台售价({sym})",f"拆分价({sym})","差额","误差%","状态"]    for c,h in enumerate(hdrs,1): sc(ws2.cell(1,c,h),font=bw,fill=hf)    errs=(pred-y)/y*100; thr=-(1-mr)*100    for ri,(rd,p,e) in enumerate(zip(data,pred,errs),2):        for c in range(nd): sc(ws2.cell(ri,c+1,fv(rd[c],units[c])))        sc(ws2.cell(ri,nd+1,round(rd[nd],2))); ws2.cell(ri,nd+1).number_format='"¥"#,##0.00'        sv=rd[nd+1]        for col,val,fs in [(nd+2,round(sv,2),f'"{sym}"#,##0.00'),(nd+3,round(p,2),f'"{sym}"#,##0.00'),(nd+4,round(p-sv,2),f'"{sym}"#,##0.00')]:            ws2.cell(ri,col,val).number_format=fs; sc(ws2.cell(ri,col))        sc(ws2.cell(ri,nd+5,round(e,1)))        if e<thr-0.05: st,fi="⚠️触红线",rf        elif e<0: st,fi=f"↓低{abs(e):.1f}%",yf        else: st,fi=f"↑高{e:.1f}%",gf        sc(ws2.cell(ri,nd+6,st),fill=fi)    for c in range(1,nd+7): ws2.column_dimensions[ws2.cell(1,c).column_letter].width=14    ws3=wb.create_sheet("误差统计")    for c,h in enumerate(["统计项","数值"],1): sc(ws3.cell(1,c,h),font=bw,fill=hf)    stats=[("总组合数",len(data)),("低于前台售价",int((errs<0).sum())),           (f"触碰{int(mr*100)}%红线",int((errs<thr-0.05).sum())),           ("高于前台售价",int((errs>0).sum())),("最大低于",f"{errs.min():.1f}%"),           ("最大高于",f"{errs.max():.1f}%"),("平均绝对误差",f"{np.abs(errs).mean():.1f}%")]    for ri,(k,v) in enumerate(stats,2): sc(ws3.cell(ri,1,k)); sc(ws3.cell(ri,2,v))    ws3.column_dimensions["A"].width=24; ws3.column_dimensions["B"].width=16    wb.save(path); return errsclass SplitWorker(QThread):    done=pyqtSignal(dict); error=pyqtSignal(str)    def __init__(self,fp,nd,fx,mode,zi,zs,mr):        super().__init__(); self.fp=fp; self.nd=nd; self.fx=fx        self.mode=mode; self.zi=zi; self.zs=zs; self.mr=mr    def run(self):        try:            data,dv,units,dn=read_data(self.fp,self.nd,self.fx,self.mode,self.zi,self.zs)            x,pred,offs,y=do_optimize(data,dv,self.nd,self.mr)            errs=(pred-y)/y*100            folder=os.path.join(os.path.dirname(self.fp),"拆分结果"); os.makedirs(folder,exist_ok=True)            base=os.path.basename(self.fp).replace(".xlsx","")            out=os.path.join(folder,f"{base}_拆分结果_{self.mode}.xlsx")            write_xl(out,self.nd,dv,dn,units,x,offs,data,pred,y,self.mr,self.mode)            thr=-(1-self.mr)*100            self.done.emit({"count":len(data),"avg_err":f"{np.abs(errs).mean():.1f}%",                            "max_low":f"{errs.min():.1f}%","max_hi":f"{errs.max():.1f}%",                            "outfile":os.path.basename(out),"outfile_path":out,                            "red":int((errs<thr-0.05).sum())})        except Exception as e: self.error.emit(str(e))class DropZone(QFrame):    def __init__(self,on_file):        super().__init__(); self.on_file=on_file; self._fp=""        self.setAcceptDrops(True); self.setMinimumHeight(120)        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))        self._ns="QFrame{background:#FAFAFA;border:2px dashed #C8C8C8;border-radius:10px;}"        self._hs="QFrame{background:#F0F7FF;border:2px dashed #0067C0;border-radius:10px;}"        self.setStyleSheet(self._ns)        lo=QVBoxLayout(self); lo.setAlignment(Qt.AlignmentFlag.AlignCenter); lo.setSpacing(6)        self.icon=QLabel("📂"); self.icon.setAlignment(Qt.AlignmentFlag.AlignCenter)        self.icon.setStyleSheet("font-size:26px; border:none; background:transparent;")        self.hint=QLabel("拖入 Excel 文件，或点击选择")        self.hint.setAlignment(Qt.AlignmentFlag.AlignCenter)        self.hint.setStyleSheet("font-family:'Segoe UI'; font-size:12px; color:#888; border:none; background:transparent;")        self.fname=QLabel(""); self.fname.setAlignment(Qt.AlignmentFlag.AlignCenter)        self.fname.setStyleSheet("font-family:'Segoe UI'; font-size:12px; font-weight:600; color:#0067C0; border:none; background:transparent;")        lo.addWidget(self.icon); lo.addWidget(self.hint); lo.addWidget(self.fname)    def mousePressEvent(self,e):        p,_=QFileDialog.getOpenFileName(self,"选择Excel文件","","Excel文件 (*.xlsx)")        if p: self._set(p)    def dragEnterEvent(self,e):        if e.mimeData().hasUrls(): e.acceptProposedAction(); self.setStyleSheet(self._hs)    def dragLeaveEvent(self,e): self.setStyleSheet(self._ns)    def dropEvent(self,e):        self.setStyleSheet(self._ns)        urls=e.mimeData().urls()        if urls: self._set(urls[0].toLocalFile())    def _set(self,p):        if not p.lower().endswith(".xlsx"):            QMessageBox.warning(self,"格式错误","请选择 .xlsx 文件"); return        self._fp=p; self.icon.setText("✅"); self.hint.setText("已选择："); self.fname.setText(os.path.basename(p)); self.on_file(p)    def get_path(self): return self._fp    def reset(self):        self._fp=""; self.icon.setText("📂"); self.hint.setText("拖入 Excel 文件，或点击选择"); self.fname.setText("")class SplitterResultRow(QWidget):    def __init__(self,label,color="#1A1A1A"):        super().__init__(); self.setStyleSheet("background:transparent;")        lo=QHBoxLayout(self); lo.setContentsMargins(0,3,0,3); lo.setSpacing(8)        lbl=QLabel(label); lbl.setObjectName("result_label"); lbl.setFixedWidth(70)        self.val=QLabel("—")        self.val.setStyleSheet(f"font-family:'Segoe UI'; font-size:13px; font-weight:600; color:{color};")        lo.addWidget(lbl); lo.addWidget(self.val); lo.addStretch()    def set(self,t): self.val.setText(t)class SplitterWindow(QMainWindow):    def __init__(self):        super().__init__()        self.setWindowTitle("定制尺寸加价拆分")        self.setFixedSize(760,560)        self.rates={"US":None,"UK":None}; self.mode="US"; self.worker=None        self._build(); self._fetch()    def _build(self):        c=QWidget(); c.setObjectName("central"); self.setCentralWidget(c)        root=QVBoxLayout(c); root.setContentsMargins(0,0,0,0); root.setSpacing(0)        tb=QFrame(); tb.setObjectName("titlebar"); tb.setFixedHeight(56)        tbl=QHBoxLayout(tb); tbl.setContentsMargins(20,0,20,0)        tbl.addWidget(QLabel("📦")); tbl.addSpacing(8)        t=QLabel("定制尺寸加价拆分"); t.setObjectName("title"); tbl.addWidget(t); tbl.addStretch()        self.mode_btns=mode_buttons(tbl,self._set_mode)        tbl.addSpacing(12)        self.rate_lbl=QLabel("获取汇率…"); self.rate_lbl.setObjectName("rate_label"); tbl.addWidget(self.rate_lbl)        root.addWidget(tb); root.addWidget(make_sep())        body=QWidget(); body.setStyleSheet("background:#DCDCDE;")        bl=QHBoxLayout(body); bl.setContentsMargins(16,16,16,16); bl.setSpacing(14)        # left        left=QVBoxLayout(); left.setSpacing(12)        fc=make_card(); fl=QVBoxLayout(fc); fl.setContentsMargins(16,14,16,14); fl.setSpacing(8)        s=QLabel("EXCEL 文件"); s.setObjectName("section"); fl.addWidget(s)        self.drop=DropZone(lambda p:None); fl.addWidget(self.drop); left.addWidget(fc)        pc=make_card(); pl=QVBoxLayout(pc); pl.setContentsMargins(16,14,16,14); pl.setSpacing(10)        s2=QLabel("参数设置"); s2.setObjectName("section"); pl.addWidget(s2)        self.inputs={}        for row_params in [[("变量列数","n_dims","3","列"),("智赢 zi","zi","10","")],                           [("智赢 zs","zs","10",""),("最低比例","min_ratio","85","%")]]:            rw=QWidget(); rw.setStyleSheet("background:transparent;")            rl=QHBoxLayout(rw); rl.setContentsMargins(0,0,0,0); rl.setSpacing(16)            for lbl,key,dflt,unit in row_params:                g=QWidget(); g.setStyleSheet("background:transparent;")                gl=QHBoxLayout(g); gl.setContentsMargins(0,0,0,0); gl.setSpacing(6)                lb=QLabel(lbl); lb.setStyleSheet("font-family:'Segoe UI'; font-size:12px; color:#444;"); lb.setFixedWidth(62)                e=QLineEdit(dflt); e.setFixedWidth(64); self.inputs[key]=e                gl.addWidget(lb); gl.addWidget(e)                if unit:                    u=QLabel(unit); u.setStyleSheet("font-family:'Segoe UI'; font-size:11px; color:#AAAAAA;"); gl.addWidget(u)                rl.addWidget(g)            rl.addStretch(); pl.addWidget(rw)        left.addWidget(pc)        br=QHBoxLayout(); br.setSpacing(10)        self.run_btn=btn_primary("▶   运  行"); self.run_btn.clicked.connect(self._run)        clb=btn_secondary("清  空"); clb.clicked.connect(self._clear)        br.addWidget(self.run_btn,3); br.addWidget(clb,1); left.addLayout(br); left.addStretch()        # right        right=QVBoxLayout()        rc=make_card(); rc.setMinimumWidth(310)        rl2=QVBoxLayout(rc); rl2.setContentsMargins(20,16,20,16); rl2.setSpacing(4)        s3=QLabel("运行结果"); s3.setObjectName("section"); rl2.addWidget(s3); rl2.addSpacing(6)        self.rows={"status":SplitterResultRow("状 态"),"count":SplitterResultRow("组合数"),                   "avg_err":SplitterResultRow("平均误差"),                   "max_low":SplitterResultRow("最大低于","#C05A00"),                   "max_hi":SplitterResultRow("最大高于","#0F7B0F")}        for r in self.rows.values(): rl2.addWidget(r)        orow=QWidget(); orow.setStyleSheet("background:transparent;")        ol=QHBoxLayout(orow); ol.setContentsMargins(0,2,0,2); ol.setSpacing(8)        olbl=QLabel("输出文件"); olbl.setObjectName("result_label"); olbl.setFixedWidth(70)        self.olink=QLabel("—")        self.olink.setStyleSheet("font-family:'Segoe UI'; font-size:13px; font-weight:600; color:#0067C0; text-decoration:underline;")        self.olink.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))        self.olink.mousePressEvent=self._open_out; self._opath=""        ol.addWidget(olbl); ol.addWidget(self.olink); ol.addStretch(); rl2.addWidget(orow)        rl2.addSpacing(10)        self.prog=QProgressBar(); self.prog.setRange(0,0); self.prog.setFixedHeight(5)        self.prog.setTextVisible(False); self.prog.setVisible(False); rl2.addWidget(self.prog)        self.warn=QLabel(""); self.warn.setStyleSheet("font-family:'Segoe UI'; font-size:11px; color:#C42B1C; background:transparent;")        self.warn.setWordWrap(True); rl2.addWidget(self.warn); rl2.addStretch()        right.addWidget(rc)        bl.addLayout(left,5); bl.addLayout(right,4); root.addWidget(body)        self._set_mode("US")    def _set_mode(self,val):        self.mode=val; refresh_mode_btns(self.mode_btns,val,self)        r=self.rates.get(val); sym="USD" if val=="US" else "GBP"        self.rate_lbl.setText(f"1 {sym} = ¥{r:.4f}" if r else f"获取 {sym} 汇率…")    def _fetch(self):        def f():            r=get_all_rates(); self.rates["US"]=r["USD"]; self.rates["UK"]=r["GBP"]            QTimer.singleShot(0,lambda:self._set_mode(self.mode))        threading.Thread(target=f,daemon=True).start()    def _clear(self):        self.drop.reset()        for k,d in [("n_dims","3"),("zi","10"),("zs","10"),("min_ratio","85")]: self.inputs[k].setText(d)        for r in self.rows.values(): r.set("—")        self.olink.setText("—"); self._opath=""; self.warn.setText(""); self.prog.setVisible(False)    def _run(self):        fp=self.drop.get_path()        if not fp: QMessageBox.warning(self,"错误","请先选择或拖入Excel文件"); return        try:            nd=int(self.inputs["n_dims"].text()); zi=float(self.inputs["zi"].text())            zs=float(self.inputs["zs"].text()); mr=float(self.inputs["min_ratio"].text())/100        except ValueError: QMessageBox.warning(self,"输入错误","参数请填写数字"); return        fx=self.rates.get(self.mode) or (7.2 if self.mode=="US" else 9.0)        self.run_btn.setEnabled(False); self.prog.setVisible(True)        self.rows["status"].set("⏳ 计算中…"); self.warn.setText("")        self.worker=SplitWorker(fp,nd,fx,self.mode,zi,zs,mr)        self.worker.done.connect(self._done); self.worker.error.connect(self._err); self.worker.start()    def _open_out(self,e=None):        if self._opath and os.path.exists(self._opath): os.startfile(self._opath)    def _done(self,res):        self.run_btn.setEnabled(True); self.prog.setVisible(False)        self.rows["status"].set("✅ 完成"); self.rows["count"].set(f"{res['count']} 个组合")        self.rows["avg_err"].set(res["avg_err"]); self.rows["max_low"].set(res["max_low"])        self.rows["max_hi"].set(res["max_hi"]); self._opath=res["outfile_path"]; self.olink.setText(res["outfile"])        if res["red"]: self.warn.setText(f"⚠  {res['red']} 个组合触碰红线")    def _err(self,msg):        self.run_btn.setEnabled(True); self.prog.setVisible(False)        self.rows["status"].set("❌ 出错"); self.warn.setText(f"错误：{msg}")# ============================================================# 更新逻辑# ============================================================def gh_raw(filename):    return f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/main/{quote(filename,safe='')}"def gh_get(url,timeout=15):    req=urllib.request.Request(url,headers={"User-Agent":"AmazonTools/1.0"})    with urllib.request.urlopen(req,timeout=timeout,context=_ssl_ctx()) as r: return r.read().decode("utf-8")class UpdateChecker(QThread):    result=pyqtSignal(dict)    def run(self):        try:            remote=json.loads(gh_get(gh_raw("version.json")))            self.result.emit({"has_update":remote.get("version","0")!=LOCAL_VERSION,"remote":remote,"error":""})        except Exception as e: self.result.emit({"has_update":False,"remote":{},"error":str(e)})class Downloader(QThread):    progress=pyqtSignal(int,str); done=pyqtSignal(bool,str)    def __init__(self,files): super().__init__(); self.files=files    def run(self):        try:            for i,fn in enumerate(self.files):                self.progress.emit(int(i/len(self.files)*90),f"下载 {fn}…")                dest=os.path.join(os.path.dirname(os.path.abspath(__file__)),fn)                raw=gh_get(gh_raw(fn),timeout=30)                with open(dest+".tmp","w",encoding="utf-8") as f: f.write(raw)                shutil.move(dest+".tmp",dest)            self.progress.emit(100,"完成"); self.done.emit(True,"更新成功，重启后生效")        except Exception as e: self.done.emit(False,str(e))class UpdateDialog(QDialog):    def __init__(self,info,parent=None):        super().__init__(parent); self.setWindowTitle("发现新版本"); self.setFixedSize(400,260)        self.info=info        lo=QVBoxLayout(self); lo.setContentsMargins(24,20,24,20); lo.setSpacing(12)        t=QLabel(f"🆕  发现新版本  v{info.get('version','?')}")        t.setStyleSheet("font-family:'Segoe UI'; font-size:15px; font-weight:700; color:#111;")        lo.addWidget(t)        lb=QLabel("更新内容："); lb.setStyleSheet("font-family:'Segoe UI'; font-size:11px; color:#555;"); lo.addWidget(lb)        box=QTextEdit(); box.setReadOnly(True); box.setFixedHeight(70); box.setText(info.get("changelog","无说明"))        box.setStyleSheet("font-family:'Segoe UI'; font-size:11px; background:#EFEFEF; border:1px solid #CCC; border-radius:6px; padding:6px; color:#333;")        lo.addWidget(box)        self.pb=QProgressBar(); self.pb.setRange(0,100); self.pb.setTextVisible(False)        self.pb.setFixedHeight(5); self.pb.setVisible(False); lo.addWidget(self.pb)        self.sl=QLabel(""); self.sl.setStyleSheet("font-family:'Segoe UI'; font-size:11px; color:#0067C0;"); lo.addWidget(self.sl)        lo.addStretch()        br=QHBoxLayout(); br.setSpacing(10)        self.ubtn=btn_primary("立即更新",36); self.ubtn.clicked.connect(self._start)        skp=btn_secondary("跳过",36); skp.clicked.connect(self.reject)        br.addStretch(); br.addWidget(skp); br.addWidget(self.ubtn); lo.addLayout(br)    def _start(self):        self.ubtn.setEnabled(False); self.pb.setVisible(True)        files=[f for f in self.info.get("files",{}).keys() if f.endswith(".py")]        self.dl=Downloader(files); self.dl.progress.connect(lambda p,m:(self.pb.setValue(p),self.sl.setText(m)))        self.dl.done.connect(self._fin); self.dl.start()    def _fin(self,ok,msg):        if ok:            # 写入新版本号到本地文件            try:                vf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local_version.json")                with open(vf, "w", encoding="utf-8") as f:                    json.dump({"version": self.info.get("version","1.0.0")}, f)            except: pass            self.sl.setText("✅ "+msg)            def _restart():                self.accept()                subprocess.Popen([sys.executable, os.path.abspath(__file__)],                                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform=="win32" else 0)                QTimer.singleShot(100, QApplication.quit)            QTimer.singleShot(1200, _restart)        else: self.sl.setText("❌ "+msg); self.ubtn.setEnabled(True)# ============================================================# 启动器主窗口# ============================================================class AppCard(QFrame):    def __init__(self,icon,name,desc,on_click):        super().__init__(); self.setFixedSize(260,210)        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))        self.setGraphicsEffect(make_shadow())        self._ns="QFrame{background:#FAFAFA;border-radius:14px;border:1px solid #D0D0D0;}"        self._hs="QFrame{background:#FFFFFF;border-radius:14px;border:1.5px solid #0067C0;}"        self._ps="QFrame{background:#F0F0F0;border-radius:14px;border:1.5px solid #005294;}"        self.setStyleSheet(self._ns)        lo=QVBoxLayout(self); lo.setContentsMargins(24,22,24,18); lo.setSpacing(8)        il=QLabel(icon); il.setStyleSheet("font-size:34px; background:transparent; border:none;")        nl=QLabel(name); nl.setStyleSheet("font-family:'Segoe UI'; font-size:14px; font-weight:700; color:#111; background:transparent; border:none;")        dl=QLabel(desc); dl.setWordWrap(True); dl.setStyleSheet("font-family:'Segoe UI'; font-size:11px; color:#666; background:transparent; border:none;")        lo.addWidget(il); lo.addWidget(nl); lo.addWidget(dl); lo.addStretch()        lb=btn_primary("启  动",34); lb.clicked.connect(on_click); lo.addWidget(lb)        self.sl=QLabel(""); self.sl.setAlignment(Qt.AlignmentFlag.AlignCenter)        self.sl.setStyleSheet("font-family:'Segoe UI'; font-size:10px; color:#0067C0; background:transparent; border:none;")        lo.addWidget(self.sl)    def flash(self,msg): self.sl.setText(msg); QTimer.singleShot(3000,lambda:self.sl.setText(""))    def enterEvent(self,e): self.setStyleSheet(self._hs); self.setGraphicsEffect(make_shadow(32,6,30))    def leaveEvent(self,e): self.setStyleSheet(self._ns); self.setGraphicsEffect(make_shadow())    def mousePressEvent(self,e): self.setStyleSheet(self._ps)    def mouseReleaseEvent(self,e): self.setStyleSheet(self._hs)class LauncherWindow(QMainWindow):    def __init__(self):        super().__init__()        self.setWindowTitle("Amazon 工具箱")        self.setFixedSize(660,380)        self._wins={}        self._build()        QTimer.singleShot(2000,self._check_update)    def _build(self):        c=QWidget(); c.setObjectName("central"); self.setCentralWidget(c)        root=QVBoxLayout(c); root.setContentsMargins(0,0,0,0); root.setSpacing(0)        tb=QFrame(); tb.setObjectName("titlebar"); tb.setFixedHeight(56)        tbl=QHBoxLayout(tb); tbl.setContentsMargins(22,0,22,0)        tbl.addWidget(QLabel("🛍️")); tbl.addSpacing(8)        t=QLabel("Amazon 卖家工具箱"); t.setObjectName("title"); tbl.addWidget(t); tbl.addStretch()        self.upd_lbl=QLabel("检查更新中…"); self.upd_lbl.setObjectName("ver_label"); tbl.addWidget(self.upd_lbl)        tbl.addSpacing(10)        ub=QPushButton("🔄 检查更新"); ub.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))        ub.setStyleSheet("QPushButton{font-family:'Segoe UI';font-size:11px;font-weight:600;color:#0067C0;background:#DCF0FF;border:none;border-radius:6px;padding:5px 12px;} QPushButton:hover{background:#CCE8FF;}")        ub.clicked.connect(lambda:(self.upd_lbl.setText("检查中…"),self._check_update()))        tbl.addWidget(ub); tbl.addSpacing(10)        vl=QLabel(f"v{LOCAL_VERSION}"); vl.setObjectName("ver_label"); tbl.addWidget(vl)        root.addWidget(tb); root.addWidget(make_sep())        body=QWidget(); body.setStyleSheet("background:#DCDCDE;")        bl=QHBoxLayout(body); bl.setContentsMargins(50,35,50,35); bl.setSpacing(30)        bl.setAlignment(Qt.AlignmentFlag.AlignCenter)        self.card_p=AppCard("🛒","定价计算器","输入产品成本、尺寸、重量，\n自动计算运费与前台售价。",self._open_pricing)        self.card_s=AppCard("📦","定制尺寸加价拆分","批量读取加价表，拆分各维度\n增量，输出定制选项价格。",self._open_splitter)        bl.addWidget(self.card_p); bl.addWidget(self.card_s); root.addWidget(body)    def _open_pricing(self):        if "pricing" not in self._wins or not self._wins["pricing"].isVisible():            w=PricingWindow(); w.setStyleSheet(COMMON_SS); self._wins["pricing"]=w        self._wins["pricing"].show(); self._wins["pricing"].raise_()        self.card_p.flash("✅ 已打开")    def _open_splitter(self):        if "splitter" not in self._wins or not self._wins["splitter"].isVisible():            w=SplitterWindow(); w.setStyleSheet(COMMON_SS); self._wins["splitter"]=w        self._wins["splitter"].show(); self._wins["splitter"].raise_()        self.card_s.flash("✅ 已打开")    def _check_update(self):        self.checker=UpdateChecker(); self.checker.result.connect(self._on_check); self.checker.start()    def _on_check(self,res):        if res["error"]: self.upd_lbl.setText("⚠ 网络不可用"); return        if res["has_update"]:            v=res["remote"].get("version","?"); self.upd_lbl.setText(f"🆕 有新版本 v{v}")            UpdateDialog(res["remote"],self).exec()        else:            self.upd_lbl.setText("✅ 已是最新版")            QTimer.singleShot(4000,lambda:self.upd_lbl.setText(f"v{LOCAL_VERSION}"))# ============================================================# 入口# ============================================================if __name__ == "__main__":    app=QApplication(sys.argv)    app.setStyleSheet(COMMON_SS)    app.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)    w=LauncherWindow(); w.show()    sys.exit(app.exec())
